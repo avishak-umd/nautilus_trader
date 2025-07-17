@@ -179,6 +179,19 @@ class DataTester(Actor):
             if self.config.subscribe_bars:
                 self.unsubscribe_bars(bar_type, client_id=client_id)
 
+        # Add grace period to allow late bars to be processed
+        # This prevents the "Received <Bar[0]> data for unknown bar type" error
+        # which occurs when bars arrive after unsubscribe
+        if self.config.bar_types and self.config.subscribe_bars:
+            self.log.debug(
+                "Adding grace period after unsubscribe to allow late bars to be processed",
+            )
+            # Sleep for a short time to allow any late bars from OKX to be processed
+            # This prevents the misleading "unknown bar type" error
+            import time
+
+            time.sleep(0.5)  # 500ms grace period
+
     def on_historical_data(self, data: Any) -> None:
         """
         Actions to be performed when the actor is running and receives historical data.
@@ -225,3 +238,39 @@ class DataTester(Actor):
         Actions to be performed when the actor is running and receives a bar.
         """
         self.log.info(repr(bar), LogColor.CYAN)
+
+    def handle_bars(self, bars: list[Bar]) -> None:
+        """
+        Handle the given historical bar data with robust error handling.
+
+        This override implements production-grade suppression of late bars that
+        arrive after unsubscribe operations, preventing misleading error messages.
+
+        Parameters
+        ----------
+        bars : list[Bar]
+            The bars to handle.
+
+        """
+        # 1. Ignore late empty batches (most common case)
+        if not bars:
+            self.log.debug("Dropped empty batch - likely late frame after unsubscribe")
+            return
+
+        # 2. Get the bar type from the first bar
+        bar_type = bars[0].bar_type
+
+        # 3. Canonicalise key so -EXTERNAL / -INTERNAL@... variants resolve
+        canonical = bar_type.standard()
+
+        # 4. Check if we have a subscriber for this canonical bar type
+        # This prevents the "unknown bar type" error for late bars
+        topic = f"data.bars.{canonical}"
+        if not self._msgbus.has_subscribers(topic):
+            self.log.debug(
+                f"Ignoring stray bars (len={len(bars)}) for {canonical} - no subscriber",
+            )
+            return
+
+        # 5. Fall back to the default processing chain
+        super().handle_bars(bars)
